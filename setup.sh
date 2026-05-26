@@ -68,6 +68,17 @@ prompt() {
 }
 
 env_get()  { grep -E "^${1}=" .env 2>/dev/null | head -1 | cut -d= -f2- || true; }
+
+# A value is "missing" if it's empty, whitespace only, or a `#`-prefixed
+# placeholder (defensive: docker-compose env doesn't support inline comments
+# but humans sometimes paste them anyway).
+env_missing() {
+  local v="$(env_get "$1")"
+  [[ -z "$v" ]] && return 0
+  [[ "$v" =~ ^[[:space:]]*$ ]] && return 0
+  [[ "$v" =~ ^[[:space:]]*# ]] && return 0
+  return 1
+}
 env_set()  {
   local k="$1" v="$2"
   # Escape sed metacharacters in value.
@@ -135,7 +146,7 @@ fi
 
 # ── 3. Headscale preauth key ───────────────────────────────────────────────
 
-if [[ -z "$(env_get FITNESS_AUTHKEY)" ]]; then
+if env_missing FITNESS_AUTHKEY; then
   log "FITNESS_AUTHKEY empty — minting one from hs.gn.al"
   # Headscale v0.28+ takes --user as a uint ID, not a username.
   # User 2 = gonzaloab@gmail.com (the personal account; user 1 is admin).
@@ -166,7 +177,7 @@ for KEY in SPARKY_FITNESS_API_ENCRYPTION_KEY:hex32 \
            SPARKY_FITNESS_DB_PASSWORD:b64_24 \
            SPARKY_FITNESS_APP_DB_PASSWORD:b64_24; do
   name="${KEY%:*}" ; gen="${KEY#*:}"
-  if [[ -z "$(env_get "$name")" ]]; then
+  if env_missing "$name"; then
     case "$gen" in
       hex32) val=$(gen_hex32) ;;
       b64_32) val=$(gen_b64_32) ;;
