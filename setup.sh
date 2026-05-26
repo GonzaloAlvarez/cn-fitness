@@ -144,8 +144,10 @@ if [[ -z "$(env_get FITNESS_AUTHKEY)" ]]; then
              'docker exec cloudnet-headscale-1 headscale preauthkeys create --user 2 --tags tag:svc --expiration 24h' \
              2>&1 | tail -1 | tr -d '\r\n'); then
     [[ -n "$KEY" ]] || die "headscale preauthkeys returned empty"
-    # Validate it looks like a preauth key (hex string, no spaces/errors)
-    [[ "$KEY" =~ ^[a-f0-9]+$ ]] || die "headscale returned non-key output: $KEY"
+    # Validate it looks like a preauth key. Headscale v0.28 emits
+    # `hskey-auth-v-<urlsafe-b64>`; older versions emit plain hex. Accept
+    # either as long as the string is reasonably long and has no whitespace.
+    [[ "$KEY" =~ ^[A-Za-z0-9_-]{32,}$ ]] || die "headscale returned non-key output: $KEY"
     env_set FITNESS_AUTHKEY "$KEY"
     log "minted preauth key (tag:svc, 24h expiry)"
   else
