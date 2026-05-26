@@ -40,6 +40,18 @@ esac
 log() { printf '\n\033[1;36m[setup]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# SSH key path differs across hosts: kaiser has ~/.ssh/main_private_key.pem,
+# the laptop has ~/.ssh/gonzalo_main_private_key.pem. Auto-detect so the
+# script is portable.
+detect_ssh_key() {
+  for p in ~/.ssh/main_private_key.pem ~/.ssh/gonzalo_main_private_key.pem; do
+    [[ -f "$p" ]] && { echo "$p"; return; }
+  done
+}
+SSH_KEY=$(detect_ssh_key)
+SSH_OPTS=(-o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -l gonzalo)
+[[ -n "$SSH_KEY" ]] && SSH_OPTS+=(-i "$SSH_KEY")
+
 prompt() {
   # echo >&2 keeps the trailing newline on stderr so it doesn't pollute
   # the value captured via $(prompt ...). See homelab/CLAUDE.md §15.
@@ -85,8 +97,7 @@ harvest_from_vault() {
   keys='^(BACKUP_S3_BUCKET|BACKUP_AWS_ACCESS_KEY_ID|BACKUP_AWS_SECRET_ACCESS_KEY|BACKUP_AWS_REGION|BACKUP_WEBDAV_URL|BACKUP_WEBDAV_USER|BACKUP_WEBDAV_PASSWORD|SMTP_HOST|SMTP_PORT|SMTP_USERNAME|SMTP_PASSWORD|SMTP_FROM|ALERT_EMAIL|ADMIN_EMAIL|INFRA_VPS_TAILNET_IP|HEADSCALE_DOMAIN|LAB_DOMAIN|TAILNET_DOMAIN|PKI_IP|TIMEZONE)='
 
   log "harvesting shared infra values from passwords.lan:~/cn-vaultwarden/.env"
-  if ! ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
-        -l gonzalo -i ~/.ssh/gonzalo_main_private_key.pem passwords.lan \
+  if ! ssh "${SSH_OPTS[@]}" passwords.lan \
         "grep -E '${keys}' ~/cn-vaultwarden/.env" > "$tmp"; then
     die "ssh to passwords.lan failed — is the Pi up and key authorized?"
   fi
@@ -126,8 +137,7 @@ fi
 
 if [[ -z "$(env_get FITNESS_AUTHKEY)" ]]; then
   log "FITNESS_AUTHKEY empty — minting one from hs.gn.al"
-  if KEY=$(ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
-             -l gonzalo -i ~/.ssh/gonzalo_main_private_key.pem hs.gn.al \
+  if KEY=$(ssh "${SSH_OPTS[@]}" hs.gn.al \
              'docker exec cloudnet-headscale-1 headscale preauthkeys create --user gonzaloalvarez --tags tag:svc --expiration 24h' \
              2>/dev/null | tr -d '\r\n'); then
     [[ -n "$KEY" ]] || die "headscale preauthkeys returned empty"
