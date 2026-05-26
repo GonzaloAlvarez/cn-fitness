@@ -137,10 +137,15 @@ fi
 
 if [[ -z "$(env_get FITNESS_AUTHKEY)" ]]; then
   log "FITNESS_AUTHKEY empty — minting one from hs.gn.al"
+  # Headscale v0.28+ takes --user as a uint ID, not a username.
+  # User 2 = gonzaloab@gmail.com (the personal account; user 1 is admin).
+  # Verify with: ssh hs.gn.al 'docker exec cloudnet-headscale-1 headscale users list'
   if KEY=$(ssh "${SSH_OPTS[@]}" hs.gn.al \
-             'docker exec cloudnet-headscale-1 headscale preauthkeys create --user gonzaloalvarez --tags tag:svc --expiration 24h' \
-             2>/dev/null | tr -d '\r\n'); then
+             'docker exec cloudnet-headscale-1 headscale preauthkeys create --user 2 --tags tag:svc --expiration 24h' \
+             2>&1 | tail -1 | tr -d '\r\n'); then
     [[ -n "$KEY" ]] || die "headscale preauthkeys returned empty"
+    # Validate it looks like a preauth key (hex string, no spaces/errors)
+    [[ "$KEY" =~ ^[a-f0-9]+$ ]] || die "headscale returned non-key output: $KEY"
     env_set FITNESS_AUTHKEY "$KEY"
     log "minted preauth key (tag:svc, 24h expiry)"
   else
