@@ -51,7 +51,14 @@ services:
       - POSTGRES_USER=${SPARKY_FITNESS_DB_USER}
       - POSTGRES_PASSWORD=${SPARKY_FITNESS_DB_PASSWORD}
     volumes:
-      - sparkyfitness_db:/var/lib/postgresql/data
+      # postgres 18+ requires the mount at /var/lib/postgresql (the docker
+      # image now expects PGDATA under a major-version-specific subdir so
+      # in-place pg_upgrade --link works without crossing mount boundaries).
+      # Mounting at /var/lib/postgresql/data trips:
+      #   "Counter to that, there appears to be PostgreSQL data in:
+      #    /var/lib/postgresql/data (unused mount/volume)" → container exit 1.
+      # See https://github.com/docker-library/postgres/pull/1259.
+      - sparkyfitness_db:/var/lib/postgresql
     labels:
       # Upstream warns against blind auto-updates: minor releases sometimes
       # need DB migrations the server doesn't auto-run. Exclude from
