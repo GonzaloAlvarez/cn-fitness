@@ -1,0 +1,8 @@
+.env
+certs/*.crt
+!certs/*.crt.example
+backups/
+uploads/
+backup/
+*.bak
+.DS_Store

@@ -1,0 +1,329 @@
+services:
+  # ── Tailscale sidecar: owns the netns shared by sparkyfitness + observability ──
+  ts-fitness:
+    image: tailscale/tailscale:latest
+    hostname: ts-fitness
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ts_state:/var/lib/tailscale
+      - ./certs/root_ca.crt:/staging-certs/root_ca.crt:ro
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_AUTHKEY=${FITNESS_AUTHKEY}
+      - TS_HOSTNAME=fitness
+      - TS_ACCEPT_DNS=true
+      - TS_AUTH_ONCE=true
+      - TS_USERSPACE=false
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+      - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
+      - SSL_CERT_DIR=/staging-certs
+    ports:
+      # Host port 3004 — confirmed free on kaiser (8080 is qb, 8083 is roms,
+      # 8085 is dashy, 8096 is jellyfin, 9091 is prom, 3000 is grafana).
+      # Frontend container/sidecar port stays 80 (SparkyFitness upstream).
+      - "127.0.0.1:3004:80"
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale ip --4 >/dev/null 2>&1"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Postgres: SparkyFitness's data store. Runs on the project bridge with
+  # a pinned IP. The IP-not-name requirement is the same cn-roms hit: the
+  # server container shares ts-fitness's netns and tailscaled overwrites
+  # /etc/resolv.conf to MagicDNS, so Docker's embedded DNS can't resolve
+  # `sparkyfitness-db` from inside the netns. `extra_hosts:` doesn't work
+  # on network_mode:service:X either. Subnet is 172.30.1.0/24 (NOT
+  # 172.30.0.0/24 — cn-roms already owns that one on this host).
+  sparkyfitness-db:
+    image: postgres:18.3-alpine
+    networks:
+      default:
+        ipv4_address: 172.30.1.10
+    environment:
+      - POSTGRES_DB=${SPARKY_FITNESS_DB_NAME}
+      - POSTGRES_USER=${SPARKY_FITNESS_DB_USER}
+      - POSTGRES_PASSWORD=${SPARKY_FITNESS_DB_PASSWORD}
+    volumes:
+      - sparkyfitness_db:/var/lib/postgresql/data
+    labels:
+      # Upstream warns against blind auto-updates: minor releases sometimes
+      # need DB migrations the server doesn't auto-run. Exclude from
+      # watchtower; bump deliberately along with the app images.
+      com.centurylinklabs.watchtower.enable: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── SparkyFitness backend (Node.js + better-auth). Shares ts-fitness's
+  # netns so the frontend (same netns) reaches it on localhost:3010.
+  sparkyfitness-server:
+    image: codewithcj/sparkyfitness_server:latest
+    network_mode: "service:ts-fitness"
+    environment:
+      - NODE_ENV=production
+      - TZ=${TIMEZONE}
+      - SPARKY_FITNESS_LOG_LEVEL=${SPARKY_FITNESS_LOG_LEVEL:-INFO}
+      # DB
+      - SPARKY_FITNESS_DB_HOST=172.30.1.10
+      - SPARKY_FITNESS_DB_PORT=5432
+      - SPARKY_FITNESS_DB_NAME=${SPARKY_FITNESS_DB_NAME}
+      - SPARKY_FITNESS_DB_USER=${SPARKY_FITNESS_DB_USER}
+      - SPARKY_FITNESS_DB_PASSWORD=${SPARKY_FITNESS_DB_PASSWORD}
+      - SPARKY_FITNESS_APP_DB_USER=${SPARKY_FITNESS_APP_DB_USER}
+      - SPARKY_FITNESS_APP_DB_PASSWORD=${SPARKY_FITNESS_APP_DB_PASSWORD}
+      # Server
+      - SPARKY_FITNESS_SERVER_HOST=sparkyfitness-server
+      - SPARKY_FITNESS_SERVER_PORT=3010
+      - SPARKY_FITNESS_FRONTEND_URL=${SPARKY_FITNESS_FRONTEND_URL}
+      - SPARKY_FITNESS_EXTRA_TRUSTED_ORIGINS=${SPARKY_FITNESS_EXTRA_TRUSTED_ORIGINS}
+      - ALLOW_PRIVATE_NETWORK_CORS=${ALLOW_PRIVATE_NETWORK_CORS:-true}
+      # Auth
+      - SPARKY_FITNESS_API_ENCRYPTION_KEY=${SPARKY_FITNESS_API_ENCRYPTION_KEY}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
+      - SPARKY_FITNESS_DISABLE_SIGNUP=${SPARKY_FITNESS_DISABLE_SIGNUP:-false}
+      - SPARKY_FITNESS_FORCE_EMAIL_LOGIN=${SPARKY_FITNESS_FORCE_EMAIL_LOGIN:-true}
+      - SPARKY_FITNESS_ADMIN_EMAIL=${ADMIN_EMAIL}
+      # SMTP (optional — password reset emails)
+      - SPARKY_FITNESS_EMAIL_HOST=${SMTP_HOST}
+      - SPARKY_FITNESS_EMAIL_PORT=${SMTP_PORT}
+      - SPARKY_FITNESS_EMAIL_SECURE=${SPARKY_FITNESS_EMAIL_SECURE:-false}
+      - SPARKY_FITNESS_EMAIL_USER=${SMTP_USERNAME}
+      - SPARKY_FITNESS_EMAIL_PASS=${SMTP_PASSWORD}
+      - SPARKY_FITNESS_EMAIL_FROM=${SMTP_FROM}
+    volumes:
+      - ./uploads:/app/SparkyFitnessServer/uploads
+      - ./backup:/app/SparkyFitnessServer/backup
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    depends_on:
+      ts-fitness:
+        condition: service_healthy
+      sparkyfitness-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── SparkyFitness frontend (nginx + React SPA). Same netns as the server,
+  # so the nginx-internal proxy_pass /api/ → localhost:3010 just works.
+  sparkyfitness-frontend:
+    image: codewithcj/sparkyfitness:latest
+    network_mode: "service:ts-fitness"
+    environment:
+      - SPARKY_FITNESS_SERVER_HOST=localhost
+      - SPARKY_FITNESS_SERVER_PORT=3010
+      - SPARKY_FITNESS_FRONTEND_URL=${SPARKY_FITNESS_FRONTEND_URL}
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    depends_on:
+      sparkyfitness-server:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Consul self-registration: makes fitness.lab.gn.al routable via traefik-lab ──
+  consul-register:
+    image: curlimages/curl:8.8.0
+    network_mode: "service:ts-fitness"
+    environment:
+      - CONSUL_ADDR=http://${INFRA_VPS_TAILNET_IP}:8500
+      - TAILNET_HOST=fitness.${TAILNET_DOMAIN}
+      - LAB_DOMAIN=${LAB_DOMAIN}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        register() {
+          NAME=$$1; PORT=$$2; SUB=$$3
+          PAYLOAD=$$(cat <<JSON
+        {
+          "Name": "$$NAME",
+          "ID": "$$NAME-fitness",
+          "Address": "$$TAILNET_HOST",
+          "Port": $$PORT,
+          "Tags": [
+            "traefik.enable=true",
+            "traefik.http.routers.$$NAME.rule=Host(\`$$SUB.$$LAB_DOMAIN\`)",
+            "traefik.http.routers.$$NAME.entrypoints=websecure",
+            "traefik.http.routers.$$NAME.tls=true",
+            "traefik.http.routers.$$NAME.tls.certresolver=dns"
+          ],
+          "Check": {
+            "TCP": "$$TAILNET_HOST:$$PORT",
+            "Interval": "10s",
+            "DeregisterCriticalServiceAfter": "2m"
+          }
+        }
+        JSON
+          )
+          curl -sf -X PUT "$$CONSUL_ADDR/v1/agent/service/register" \
+               -H "Content-Type: application/json" -d "$$PAYLOAD" >/dev/null \
+            && echo "registered $$NAME ($$SUB.$$LAB_DOMAIN -> :$$PORT)" \
+            || echo "FAILED to register $$NAME" >&2
+        }
+        while true; do
+          register fitness 80 fitness
+          sleep 60
+        done
+    depends_on:
+      ts-fitness:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── promtail: ship container logs to VPS Loki ──
+  promtail:
+    image: grafana/promtail:3.4.2
+    network_mode: "service:ts-fitness"
+    command: ["-config.file=/etc/promtail/promtail.yml", "-config.expand-env=true"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - INFRA_VPS_TAILNET_IP=${INFRA_VPS_TAILNET_IP}
+    depends_on:
+      ts-fitness:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── node-exporter: stack-level host metrics into VPS Prometheus ──
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: "service:ts-fitness"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    depends_on:
+      ts-fitness:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── postgres-exporter: DB-level metrics. Uses superuser (not the limited
+  # APP_DB_USER) because pg_stat_* views require pg_monitor or superuser.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    network_mode: "service:ts-fitness"
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${SPARKY_FITNESS_DB_USER}:${SPARKY_FITNESS_DB_PASSWORD}@172.30.1.10:5432/${SPARKY_FITNESS_DB_NAME}?sslmode=disable
+    depends_on:
+      ts-fitness:
+        condition: service_healthy
+      sparkyfitness-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── pg-dump: app-consistent Postgres dumps every 12h to ./backups.
+  # Lives on the project bridge (not in ts-fitness netns) so it can reach
+  # the DB by name or by the pinned IP — we use IP for consistency.
+  pg-dump:
+    image: prodrigestivill/postgres-backup-local:18
+    environment:
+      - POSTGRES_HOST=172.30.1.10
+      - POSTGRES_DB=${SPARKY_FITNESS_DB_NAME}
+      - POSTGRES_USER=${SPARKY_FITNESS_DB_USER}
+      - POSTGRES_PASSWORD=${SPARKY_FITNESS_DB_PASSWORD}
+      - POSTGRES_EXTRA_OPTS=--format=custom --blobs --compress=6
+      - SCHEDULE=@every 12h
+      - BACKUP_KEEP_DAYS=14
+      - BACKUP_KEEP_WEEKS=8
+      - BACKUP_KEEP_MONTHS=6
+      - HEALTHCHECK_PORT=8080
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      sparkyfitness-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── offen-backup: tier-2 off-site backup. Weekly tarballs of the pg-dump
+  # output + ./uploads, shipped to S3 + raidnas WebDAV with SMTP notify.
+  # Mirrors cn-vaultwarden/cn-netbox shape; reuses the shared
+  # cloudnet-lab-storage bucket via the `fitness/` path prefix.
+  backup:
+    image: offen/docker-volume-backup:v2.43.4
+    environment:
+      - BACKUP_CRON_EXPRESSION=0 3 * * 0
+      - BACKUP_FILENAME=fitness-%Y-%m-%dT%H-%M-%S.tar.gz
+      - BACKUP_RETENTION_DAYS=56
+      - AWS_S3_BUCKET_NAME=${BACKUP_S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${BACKUP_AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${BACKUP_AWS_SECRET_ACCESS_KEY}
+      - AWS_S3_REGION=${BACKUP_AWS_REGION}
+      - AWS_S3_PATH=fitness/
+      - WEBDAV_URL=${BACKUP_WEBDAV_URL}
+      - WEBDAV_PATH=/fitness/
+      - WEBDAV_USERNAME=${BACKUP_WEBDAV_USER}
+      - WEBDAV_PASSWORD=${BACKUP_WEBDAV_PASSWORD}
+      - NOTIFICATION_URLS=smtp://${SMTP_USERNAME}:${SMTP_PASSWORD}@${SMTP_HOST}:${SMTP_PORT}/?from=${SMTP_FROM}&to=${ALERT_EMAIL}&starttls=yes
+      - NOTIFICATION_LEVEL=info
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./backups:/backup/pg-dumps:ro
+      - ./uploads:/backup/uploads:ro
+    restart: unless-stopped
+
+  # ── ts-fitness watchdog: force-recreate dependents on netns drift ──
+  ts-fitness-watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache docker-cli-compose >/dev/null
+        echo "[watchdog] ready, polling ts-fitness every 10s"
+        LAST=""
+        while true; do
+          CUR=$$(docker inspect cn-fitness-ts-fitness-1 --format "{{.State.StartedAt}}" 2>/dev/null || true)
+          if [ -n "$$CUR" ] && [ -n "$$LAST" ] && [ "$$CUR" != "$$LAST" ]; then
+            echo "[watchdog] ts-fitness restarted (was $$LAST, now $$CUR), recreating dependents"
+            docker compose -p cn-fitness up -d --force-recreate --no-deps \
+              sparkyfitness-server sparkyfitness-frontend consul-register \
+              promtail node-exporter postgres-exporter \
+              && echo "[watchdog] OK" \
+              || echo "[watchdog] FAILED"
+          fi
+          LAST="$$CUR"
+          sleep 10
+        done
+    restart: unless-stopped
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    command:
+      - "--cleanup"
+      - "--schedule=0 0 5 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_API_VERSION=1.45
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        # 172.30.1.0/24 — cn-roms already owns 172.30.0.0/24 on this host.
+        - subnet: 172.30.1.0/24
+
+volumes:
+  ts_state:
+  sparkyfitness_db:

@@ -1,0 +1,5 @@
+Placeholder — setup.sh fetches the real cert from http://${PKI_IP}/cert/ca.crt
+into certs/root_ca.crt (gitignored). ts-fitness mounts it at
+/staging-certs/root_ca.crt so the sidecar trusts step-ca during tailnet
+login. Plain-HTTP fetch is intentional (chicken-and-egg: can't TLS-verify
+step-ca without already having its root).
