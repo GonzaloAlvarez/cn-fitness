@@ -284,6 +284,12 @@ services:
     restart: unless-stopped
 
   # ── ts-fitness watchdog: force-recreate dependents on netns drift ──
+  # Detects drift by comparing each dependent's HostConfig.NetworkMode
+  # ("container:<id>") against ts-fitness's current container ID. This
+  # catches pre-existing drift on the watchdog's own first poll (so a
+  # restart of the watchdog self-heals), survives transient `docker
+  # inspect` failures during host-wide image churn (no LAST/CUR state to
+  # corrupt), and silently no-ops in steady state.
   ts-fitness-watchdog:
     image: docker:cli
     volumes:
@@ -295,19 +301,26 @@ services:
       - -c
       - |
         apk add --no-cache docker-cli-compose >/dev/null
-        echo "[watchdog] ready, polling ts-fitness every 10s"
-        LAST=""
+        DEPS="sparkyfitness-server sparkyfitness-frontend consul-register promtail node-exporter postgres-exporter"
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS)"
         while true; do
-          CUR=$$(docker inspect cn-fitness-ts-fitness-1 --format "{{.State.StartedAt}}" 2>/dev/null || true)
-          if [ -n "$$CUR" ] && [ -n "$$LAST" ] && [ "$$CUR" != "$$LAST" ]; then
-            echo "[watchdog] ts-fitness restarted (was $$LAST, now $$CUR), recreating dependents"
-            docker compose -p cn-fitness up -d --force-recreate --no-deps \
-              sparkyfitness-server sparkyfitness-frontend consul-register \
-              promtail node-exporter postgres-exporter \
-              && echo "[watchdog] OK" \
-              || echo "[watchdog] FAILED"
+          TS_ID=$$(docker inspect cn-fitness-ts-fitness-1 --format "{{.Id}}" 2>/dev/null || true)
+          if [ -n "$$TS_ID" ]; then
+            DRIFTED=""
+            for dep in $$DEPS; do
+              DEP_NM=$$(docker inspect cn-fitness-$$dep-1 --format "{{.HostConfig.NetworkMode}}" 2>/dev/null || true)
+              DEP_TARGET=$${DEP_NM#container:}
+              if [ -n "$$DEP_NM" ] && [ "$$DEP_TARGET" != "$$TS_ID" ]; then
+                DRIFTED="$$DRIFTED $$dep"
+              fi
+            done
+            if [ -n "$$DRIFTED" ]; then
+              echo "[watchdog] netns drift on:$$DRIFTED -- recreating"
+              docker compose -p cn-fitness up -d --force-recreate --no-deps $$DRIFTED \
+                && echo "[watchdog] OK" \
+                || echo "[watchdog] FAILED"
+            fi
           fi
-          LAST="$$CUR"
           sleep 10
         done
     restart: unless-stopped
