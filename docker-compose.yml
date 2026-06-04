@@ -289,7 +289,14 @@ services:
   # catches pre-existing drift on the watchdog's own first poll (so a
   # restart of the watchdog self-heals), survives transient `docker
   # inspect` failures during host-wide image churn (no LAST/CUR state to
-  # corrupt), and silently no-ops in steady state.
+  # corrupt), and silently no-ops in steady state. Also restarts dependents
+  # stuck in non-running status (e.g. Created-but-never-started after a
+  # midway compose failure).
+  # The drift threshold (3 polls = 30s) prevents the watchdog from racing
+  # a stack-wide `docker compose up`: a legitimate compose-up resettles
+  # dependents in <30s, so transient drift is ignored; real netns drift
+  # after a tailscaled crash persists, so the watchdog still fires within
+  # ~30s.
   ts-fitness-watchdog:
     image: docker:cli
     volumes:
@@ -302,23 +309,45 @@ services:
       - |
         apk add --no-cache docker-cli-compose >/dev/null
         DEPS="sparkyfitness-server sparkyfitness-frontend consul-register promtail node-exporter postgres-exporter"
-        echo "[watchdog] ready, polling dependents every 10s ($$DEPS)"
+        ACTION_THRESHOLD=3
+        ACTION_COUNT=0
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS), drift threshold $$ACTION_THRESHOLD polls"
         while true; do
           TS_ID=$$(docker inspect cn-fitness-ts-fitness-1 --format "{{.Id}}" 2>/dev/null || true)
           if [ -n "$$TS_ID" ]; then
-            DRIFTED=""
+            NEED_RECREATE=""
+            NEED_START=""
             for dep in $$DEPS; do
-              DEP_NM=$$(docker inspect cn-fitness-$$dep-1 --format "{{.HostConfig.NetworkMode}}" 2>/dev/null || true)
+              INFO=$$(docker inspect cn-fitness-$$dep-1 --format "{{.HostConfig.NetworkMode}} {{.State.Status}}" 2>/dev/null || true)
+              [ -n "$$INFO" ] || continue
+              DEP_NM=$$(echo "$$INFO" | awk "{print \$$1}")
+              DEP_STATUS=$$(echo "$$INFO" | awk "{print \$$2}")
               DEP_TARGET=$${DEP_NM#container:}
-              if [ -n "$$DEP_NM" ] && [ "$$DEP_TARGET" != "$$TS_ID" ]; then
-                DRIFTED="$$DRIFTED $$dep"
+              if [ "$$DEP_TARGET" != "$$TS_ID" ]; then
+                NEED_RECREATE="$$NEED_RECREATE $$dep"
+              elif [ "$$DEP_STATUS" != "running" ]; then
+                NEED_START="$$NEED_START $$dep"
               fi
             done
-            if [ -n "$$DRIFTED" ]; then
-              echo "[watchdog] netns drift on:$$DRIFTED -- recreating"
-              docker compose -p cn-fitness up -d --force-recreate --no-deps $$DRIFTED \
-                && echo "[watchdog] OK" \
-                || echo "[watchdog] FAILED"
+            if [ -n "$$NEED_RECREATE" ] || [ -n "$$NEED_START" ]; then
+              ACTION_COUNT=$$((ACTION_COUNT + 1))
+              if [ "$$ACTION_COUNT" -ge "$$ACTION_THRESHOLD" ]; then
+                if [ -n "$$NEED_RECREATE" ]; then
+                  echo "[watchdog] persistent drift on:$$NEED_RECREATE -- recreating"
+                  docker compose -p cn-fitness up -d --force-recreate --no-deps $$NEED_RECREATE \
+                    && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
+                fi
+                if [ -n "$$NEED_START" ]; then
+                  echo "[watchdog] persistent stopped on:$$NEED_START -- starting"
+                  docker compose -p cn-fitness start $$NEED_START \
+                    && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+                fi
+                ACTION_COUNT=0
+              else
+                echo "[watchdog] action pending (drift:$$NEED_RECREATE start:$$NEED_START count=$$ACTION_COUNT/$$ACTION_THRESHOLD)"
+              fi
+            else
+              ACTION_COUNT=0
             fi
           fi
           sleep 10
