@@ -1,0 +1,7 @@
+# amun-docker resiliency manifest — installs a docker-compose@<stack>
+# boot unit + an /etc/cron.d reconcile job. See amun-docker README.
+boot:
+  enabled: true
+reconcile:
+  enabled: true
+  schedule: "*/5 * * * *"
