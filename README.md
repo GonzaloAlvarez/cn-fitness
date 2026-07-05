@@ -34,27 +34,24 @@ bridge IP, **but** the subnet is `172.30.1.0/24` (cn-roms owns
 # On kaiser (fresh clone):
 git clone git@github.com:GonzaloAlvarez/cn-fitness.git ~/cn-fitness
 cd ~/cn-fitness
-./setup.sh --core
+kauket get kaiser.cn_fitness_env   # installs .env (0600) — Kauket-managed
+./setup.sh
 ```
 
-`--core` harvests SMTP/S3/WebDAV/ADMIN_EMAIL and other shared infra values from
-`passwords.lan:~/cn-vaultwarden/.env` over SSH (same pattern as
-`cn-netbox/seal-secrets.sh --core`). What setup.sh does:
+The `.env` (DB passwords, `SPARKY_FITNESS_API_ENCRYPTION_KEY`,
+`BETTER_AUTH_SECRET`, `FITNESS_AUTHKEY`, SMTP + backup creds) is Kauket-managed
+(`kaiser.cn_fitness_env`) — no longer generated, harvested from `passwords.lan`,
+or minted here. What setup.sh does:
 
-1. Creates `.env` from `.env.example` if missing.
-2. (`--core`) harvests shared values from `passwords.lan`.
-3. Mints a Headscale preauth key if `FITNESS_AUTHKEY` is empty.
-4. Auto-generates random secrets (`SPARKY_FITNESS_API_ENCRYPTION_KEY`,
-   `BETTER_AUTH_SECRET`, DB passwords).
-5. Fetches the step-ca root CA from `http://pki.lan/cert/ca.crt`.
-6. Renders `promtail/promtail.yml` from the template.
-7. `docker compose up -d --remove-orphans`.
-8. **Auto-creates the admin user** via `POST /api/auth/sign-up/email` with a
-   random temporary password, then flips `SPARKY_FITNESS_DISABLE_SIGNUP=true`
-   and restarts `sparkyfitness-server` to enforce.
-9. **Prints the temp password to stdout exactly once.** Paste it into
-   Vaultwarden immediately, then log in at `https://fitness.kaiser.lan` and
-   change it.
+1. Fetches the step-ca root CA from `http://pki.lan/cert/ca.crt`.
+2. Renders `promtail/promtail.yml` from the template.
+3. `docker compose up -d --remove-orphans`.
+4. **On a fresh install (signup still enabled)** auto-creates the admin user via
+   `POST /api/auth/sign-up/email` with a one-time temporary password, flips
+   `SPARKY_FITNESS_DISABLE_SIGNUP=true`, and restarts `sparkyfitness-server`.
+   The temp password is printed once — save it in your password manager, log in
+   at `https://fitness.kaiser.lan`, and change it. (Skipped when signup is
+   already disabled, e.g. after a DB restore.)
 
 ## Mobile apps
 

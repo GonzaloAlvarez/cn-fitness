@@ -1,29 +1,19 @@
 #!/usr/bin/env bash
 # cn-fitness — idempotent bring-up.
 #
-# Flags:
-#   --core   Harvest shared infra values (SMTP, S3, WebDAV, ADMIN_EMAIL,
-#            and several domain/PKI vars) from passwords.lan:~/cn-vaultwarden/.env
-#            over SSH. Same pattern as cn-netbox/seal-secrets.sh --core.
+# The .env is Kauket-managed (secret id kaiser.cn_fitness_env); secrets and the
+# Headscale authkey are NO LONGER generated / harvested / minted here. This
+# script fetches the step-ca root, renders promtail, brings the stack up, and
+# (only on a genuinely fresh install where signup is still enabled) bootstraps
+# the admin user.
 #
-# What this script does (idempotent — safe to re-run):
-#   1. Renders .env from .env.example if missing.
-#   2. (--core) harvests shared values from passwords.lan.
-#   3. Mints a Headscale preauth key if FITNESS_AUTHKEY is empty.
-#   4. Auto-generates random secrets (API encryption, better-auth, DB passwords).
-#   5. Fetches step-ca root CA over plain HTTP (chicken-and-egg).
-#   6. Renders promtail/promtail.yml from the .tmpl.
-#   7. Brings the stack up (docker compose up -d).
-#   8. Auto-creates the admin user via POST /api/auth/sign-up/email, then
-#      flips SPARKY_FITNESS_DISABLE_SIGNUP=true and restarts the server.
-#   9. Prints the temporary admin password (one-shot; not stored on disk).
+#   kauket get kaiser.cn_fitness_env   # installs .env (0600)
+#   ./setup.sh
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-CORE_ONLY=0
 case "${1:-}" in
-  --core) CORE_ONLY=1 ;;
   -h|--help)
     sed -n '/^#!/d; /^[^#]/q; s/^# \{0,1\}//p' "$0"
     exit 0
@@ -40,48 +30,9 @@ esac
 log() { printf '\n\033[1;36m[setup]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# SSH key path differs across hosts: kaiser has ~/.ssh/main_private_key.pem,
-# the laptop has ~/.ssh/gonzalo_main_private_key.pem. Auto-detect so the
-# script is portable.
-detect_ssh_key() {
-  for p in ~/.ssh/main_private_key.pem ~/.ssh/gonzalo_main_private_key.pem; do
-    [[ -f "$p" ]] && { echo "$p"; return; }
-  done
-}
-SSH_KEY=$(detect_ssh_key)
-SSH_OPTS=(-o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -l gonzalo)
-[[ -n "$SSH_KEY" ]] && SSH_OPTS+=(-i "$SSH_KEY")
-
-prompt() {
-  # echo >&2 keeps the trailing newline on stderr so it doesn't pollute
-  # the value captured via $(prompt ...). See homelab/CLAUDE.md §15.
-  local label="$1" default="${2:-}" hidden="${3:-}" value
-  if [[ -n "$hidden" ]]; then
-    read -rsp "${label}: " value; echo >&2
-  elif [[ -n "$default" ]]; then
-    read -rp "${label} [${default}]: " value
-    value="${value:-$default}"
-  else
-    read -rp "${label}: " value
-  fi
-  printf '%s' "$value"
-}
-
 env_get()  { grep -E "^${1}=" .env 2>/dev/null | head -1 | cut -d= -f2- || true; }
-
-# A value is "missing" if it's empty, whitespace only, or a `#`-prefixed
-# placeholder (defensive: docker-compose env doesn't support inline comments
-# but humans sometimes paste them anyway).
-env_missing() {
-  local v="$(env_get "$1")"
-  [[ -z "$v" ]] && return 0
-  [[ "$v" =~ ^[[:space:]]*$ ]] && return 0
-  [[ "$v" =~ ^[[:space:]]*# ]] && return 0
-  return 1
-}
 env_set()  {
   local k="$1" v="$2"
-  # Escape sed metacharacters in value.
   local esc
   esc=$(printf '%s\n' "$v" | sed -e 's/[\/&]/\\&/g')
   if grep -qE "^${k}=" .env; then
@@ -91,105 +42,11 @@ env_set()  {
   fi
 }
 
-# ── 1. .env scaffold ───────────────────────────────────────────────────────
+[[ -f .env ]] || die ".env not found. Run: kauket get kaiser.cn_fitness_env"
 
-if [[ ! -f .env ]]; then
-  log "creating .env from .env.example"
-  cp .env.example .env
-  chmod 600 .env
-fi
+# ── step-ca root CA ─────────────────────────────────────────────────────────
 
-# ── 2. Harvest from passwords.lan (--core) ─────────────────────────────────
-
-harvest_from_vault() {
-  local tmp keys
-  tmp=$(mktemp)
-  trap "rm -f '$tmp'" RETURN
-  keys='^(BACKUP_S3_BUCKET|BACKUP_AWS_ACCESS_KEY_ID|BACKUP_AWS_SECRET_ACCESS_KEY|BACKUP_AWS_REGION|BACKUP_WEBDAV_URL|BACKUP_WEBDAV_USER|BACKUP_WEBDAV_PASSWORD|SMTP_HOST|SMTP_PORT|SMTP_USERNAME|SMTP_PASSWORD|SMTP_FROM|ALERT_EMAIL|ADMIN_EMAIL|INFRA_VPS_TAILNET_IP|HEADSCALE_DOMAIN|LAB_DOMAIN|TAILNET_DOMAIN|PKI_IP|TIMEZONE)='
-
-  log "harvesting shared infra values from passwords.lan:~/cn-vaultwarden/.env"
-  if ! ssh "${SSH_OPTS[@]}" passwords.lan \
-        "grep -E '${keys}' ~/cn-vaultwarden/.env" > "$tmp"; then
-    die "ssh to passwords.lan failed — is the Pi up and key authorized?"
-  fi
-
-  [[ -s "$tmp" ]] || die "no matching keys harvested from passwords.lan"
-
-  # Source into a subshell-safe set, then mirror each into .env.
-  set -a
-  # shellcheck disable=SC1090
-  . "$tmp"
-  set +a
-
-  local k v missing=()
-  for k in BACKUP_S3_BUCKET BACKUP_AWS_ACCESS_KEY_ID BACKUP_AWS_SECRET_ACCESS_KEY BACKUP_AWS_REGION \
-           SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM ALERT_EMAIL ADMIN_EMAIL; do
-    v="${!k:-}"
-    [[ -n "$v" ]] || missing+=("$k")
-    [[ -n "$v" ]] && env_set "$k" "$v"
-  done
-  # Optional / less-strict
-  for k in BACKUP_WEBDAV_URL BACKUP_WEBDAV_USER BACKUP_WEBDAV_PASSWORD \
-           INFRA_VPS_TAILNET_IP HEADSCALE_DOMAIN LAB_DOMAIN TAILNET_DOMAIN PKI_IP TIMEZONE; do
-    v="${!k:-}"
-    [[ -n "$v" ]] && env_set "$k" "$v"
-  done
-
-  (( ${#missing[@]} == 0 )) || die "missing required keys in source .env: ${missing[*]}"
-
-  log "harvested: S3=${BACKUP_S3_BUCKET} smtp=${SMTP_HOST}:${SMTP_PORT} from=${SMTP_FROM} admin=${ADMIN_EMAIL}"
-}
-
-if (( CORE_ONLY == 1 )); then
-  harvest_from_vault
-fi
-
-# ── 3. Headscale preauth key ───────────────────────────────────────────────
-
-if env_missing FITNESS_AUTHKEY; then
-  log "FITNESS_AUTHKEY empty — minting one from hs.gn.al"
-  # Headscale v0.28+ takes --user as a uint ID, not a username.
-  # User 2 = gonzaloab@gmail.com (the personal account; user 1 is admin).
-  # Verify with: ssh hs.gn.al 'docker exec cloudnet-headscale-1 headscale users list'
-  if KEY=$(ssh "${SSH_OPTS[@]}" hs.gn.al \
-             'docker exec cloudnet-headscale-1 headscale preauthkeys create --user 2 --tags tag:svc --expiration 24h' \
-             2>&1 | tail -1 | tr -d '\r\n'); then
-    [[ -n "$KEY" ]] || die "headscale preauthkeys returned empty"
-    # Validate it looks like a preauth key. Headscale v0.28 emits
-    # `hskey-auth-v-<urlsafe-b64>`; older versions emit plain hex. Accept
-    # either as long as the string is reasonably long and has no whitespace.
-    [[ "$KEY" =~ ^[A-Za-z0-9_-]{32,}$ ]] || die "headscale returned non-key output: $KEY"
-    env_set FITNESS_AUTHKEY "$KEY"
-    log "minted preauth key (tag:svc, 24h expiry)"
-  else
-    die "failed to mint preauth key — fill FITNESS_AUTHKEY in .env manually"
-  fi
-fi
-
-# ── 4. Auto-generate random secrets where empty ────────────────────────────
-
-gen_hex32()    { openssl rand -hex 32; }
-gen_b64_32()   { openssl rand -base64 32 | tr -d '\n'; }
-gen_b64_24()   { openssl rand -base64 24 | tr -d '\n'; }
-
-for KEY in SPARKY_FITNESS_API_ENCRYPTION_KEY:hex32 \
-           BETTER_AUTH_SECRET:b64_32 \
-           SPARKY_FITNESS_DB_PASSWORD:b64_24 \
-           SPARKY_FITNESS_APP_DB_PASSWORD:b64_24; do
-  name="${KEY%:*}" ; gen="${KEY#*:}"
-  if env_missing "$name"; then
-    case "$gen" in
-      hex32) val=$(gen_hex32) ;;
-      b64_32) val=$(gen_b64_32) ;;
-      b64_24) val=$(gen_b64_24) ;;
-    esac
-    env_set "$name" "$val"
-    log "generated $name"
-  fi
-done
-
-# ── 5. step-ca root CA ─────────────────────────────────────────────────────
-
+mkdir -p certs
 PKI_IP_VAL="$(env_get PKI_IP)"
 PKI_IP_VAL="${PKI_IP_VAL:-pki.lan}"
 if [[ ! -f certs/root_ca.crt ]]; then
@@ -198,7 +55,7 @@ if [[ ! -f certs/root_ca.crt ]]; then
     || die "could not fetch root CA from ${PKI_IP_VAL}"
 fi
 
-# ── 6. Render promtail config ──────────────────────────────────────────────
+# ── Render promtail config ──────────────────────────────────────────────────
 
 INFRA_VPS_TAILNET_IP="$(env_get INFRA_VPS_TAILNET_IP)" \
   envsubst < promtail/promtail.yml.tmpl > promtail/promtail.yml
@@ -206,16 +63,16 @@ log "rendered promtail/promtail.yml"
 
 mkdir -p backups uploads backup
 
-# ── 7. Bring the stack up ──────────────────────────────────────────────────
+# ── Bring the stack up ──────────────────────────────────────────────────────
 
 log "docker compose up -d --remove-orphans"
 docker compose up -d --remove-orphans
 
-# ── 8. First-user bootstrap ────────────────────────────────────────────────
+# ── First-user bootstrap (only when signup is still enabled) ────────────────
 
 ADMIN_EMAIL_VAL="$(env_get ADMIN_EMAIL)"
 if [[ -z "$ADMIN_EMAIL_VAL" ]]; then
-  die "ADMIN_EMAIL is empty — cannot bootstrap admin user. Set it in .env or rerun with --core."
+  die "ADMIN_EMAIL is empty in the Kauket-managed .env — cannot bootstrap admin user."
 fi
 
 DISABLE_SIGNUP_VAL="$(env_get SPARKY_FITNESS_DISABLE_SIGNUP)"
@@ -271,7 +128,7 @@ else
   rm -f /tmp/cn-fitness-signup.json
 fi
 
-# ── 9. Summary ─────────────────────────────────────────────────────────────
+# ── Summary ─────────────────────────────────────────────────────────────────
 
 cat <<EOF
 
@@ -290,11 +147,13 @@ if [[ -n "${TEMP_PW:-}" ]]; then
     Email     : ${ADMIN_EMAIL_VAL}
     Password  : ${TEMP_PW}
 
-  ⚠  This password is SHOWN ONCE — paste it into Vaultwarden NOW,
-     then log in at https://fitness.kaiser.lan and change it.
+  ⚠  This is a one-time signup password — save it in your password manager
+     NOW, then log in at https://fitness.kaiser.lan and change it.
 EOF
 fi
 
 cat <<EOF
+  The .env (DB passwords, encryption/auth secrets, FITNESS_AUTHKEY, SMTP,
+  backup creds) is Kauket-managed (kaiser.cn_fitness_env).
 ===============================================================
 EOF
